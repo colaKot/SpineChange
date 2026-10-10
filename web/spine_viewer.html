@@ -28,10 +28,10 @@
            padding: 4px 10px; cursor: pointer; }
   button:hover { background: #3a4354; }
   button:disabled { opacity: .5; cursor: default; }
-  #actions { flex: 1; overflow: auto; padding: 6px; }
+  #actions { flex: 1; min-height: 0; overflow: auto; padding-top: 2px; }
   #actions button { display: block; width: 100%; text-align: left; margin-bottom: 4px; }
   #actions button.on { background: #2b6cb0; border-color: #3f8fd8; }
-  #status { padding: 6px 8px; font-size: 12px; color: #9aa3b2; min-height: 20px; }
+  #status { padding: 4px 0 0; font-size: 12px; color: #9aa3b2; }
   #err { position: fixed; left: 8px; top: 8px; right: 8px; white-space: pre-wrap; color: #ff8080;
          background: #000c; padding: 6px; z-index: 99; display: none; font-family: Consolas, monospace; }
 </style>
@@ -59,15 +59,17 @@
       </div>
       <div style="color:#7a8291;font-size:12px">画布可拖动平移，滚轮缩放</div>
     </div>
-    <div class="box" id="exportbox">
-      <h3>导出 MP4</h3>
-      <div class="row"><button id="expbtn">转视频</button></div>
+    <div class="box" id="exportbox" style="padding:6px 8px">
+      <div class="row" style="margin-bottom:0">
+        <h3 style="margin:0">导出 MP4</h3>
+        <button id="expbtn">转视频</button>
+      </div>
       <div id="status">调整好位置后点「转视频」</div>
     </div>
     <div class="box" style="flex:1;display:flex;flex-direction:column;min-height:0;border-bottom:none">
       <h3>动作</h3>
+      <div id="actions"></div>
     </div>
-    <div id="actions"></div>
   </div>
 </div>
 
@@ -75,7 +77,11 @@
 <script src="lib/pixi-spine-3.8.js"></script>
 <script>
 const Q = new URLSearchParams(location.search);
-const JSON_NAME = Q.get('json') || '';
+const SKEL_NAME = Q.get('json') || '';
+const SRC_VER = Q.get('ver') || '';
+const WIN_TITLE = Q.get('title') || '';
+// 内嵌时用带随机后缀的标题,方便主程序按标题找到这个窗口挂进 tk 界面
+if (WIN_TITLE) document.title = WIN_TITLE;
 
 function fail(msg) {
   const el = document.getElementById('err');
@@ -110,15 +116,16 @@ function paintBg() {
 }
 paintBg();
 
-PIXI.Loader.shared.add('sp', '/res/' + encodeURIComponent(JSON_NAME)).load((ld, res) => {
+// .json 是服务端转好的 3.8;.skel 是本身就 3.8 的二进制,直接读
+PIXI.Loader.shared.add('sp', '/api/skeleton/' + encodeURIComponent(SKEL_NAME)).load((ld, res) => {
   const data = res.sp.spineData;
   spine = new PIXI.spine.Spine(data);
   // pixi-spine 的 autoUpdate 会在渲染时再按墙上时间推一次动作,和我们 ticker 叠加就是双倍速,关掉
   spine.autoUpdate = false;
   app.stage.addChild(spine);
 
-  document.getElementById('nm').textContent = 'Spine 名称: ' + (data.name || JSON_NAME.replace(/\.[^.]+$/, ''));
-  document.getElementById('vr').textContent = 'Spine 版本: ' + (data.version || '未知');
+  document.getElementById('nm').textContent = 'Spine 名称: ' + (data.name || SKEL_NAME.replace(/\.[^.]+$/, ''));
+  document.getElementById('vr').textContent = 'Spine 版本: ' + (SRC_VER || data.version || '未知');
 
   spine.skeleton.setToSetupPose();
   spine.skeleton.updateWorldTransform();

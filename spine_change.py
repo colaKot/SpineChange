@@ -1157,6 +1157,19 @@ def _is_v38(version):
     return len(parts) >= 2 and parts[0] == '3' and parts[1] == '8'
 
 
+def peek_spine_version(path):
+    """只读原始素材的版本号(不做转换),预览里要显示转换前的版本"""
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+        if raw[:1] == b'{':
+            data = json.loads(raw.decode('utf-8'))
+            return (data.get('skeleton') or {}).get('spine', '') or ''
+        return detect_skel_version(raw) or ''
+    except Exception:
+        return ''
+
+
 def load_skeleton_json(path):
     """把 .skel / .json 骨架读成 3.8 兼容的字典,供预览渲染使用"""
     ext = os.path.splitext(path)[1].lower()
@@ -1189,40 +1202,31 @@ def load_skeleton_json(path):
 # ======================== Tkinter UI ========================
 
 class PreviewPanel(ttk.Frame):
-    """Spine 预览 / 转视频:渲染交给网页里的 pixi-spine(WebGL),这里只负责选素材和开窗口"""
-
-    TIP = ("渲染走网页(WebGL),播放、拖动、缩放都跟得上。窗口右侧是动作列表和「转视频」,\n"
-           "选好动作、调好缩放位置后点它,就按当前所见逐帧导出 MP4。")
+    """Spine 预览 / 转视频:渲染交给内嵌的网页 pixi-spine(WebGL),这里只负责选素材"""
 
     def __init__(self, master, app):
-        super().__init__(master, padding=10)
+        super().__init__(master, padding=6)
         self.app = app
         self.skel_path = None
+        self.src_ver = ''
+        self.req_name = ''
+        self.browser = None
         self._build()
 
     def _build(self):
         top = ttk.Frame(self)
         top.pack(fill=tk.X)
         ttk.Button(top, text="打开 Spine 素材...", command=self.open_asset).pack(side=tk.LEFT)
+        ttk.Button(top, text="重新加载预览", command=self.open_window).pack(side=tk.LEFT, padx=(6, 0))
         self.path_var = tk.StringVar(value="未加载素材")
         ttk.Label(top, textvariable=self.path_var, foreground="#666").pack(side=tk.LEFT, padx=8)
-
-        info = ttk.LabelFrame(self, text="素材信息")
-        info.pack(fill=tk.X, pady=10)
-        self.name_var = tk.StringVar(value="Spine 名称: -")
-        self.ver_var = tk.StringVar(value="Spine 版本: -")
-        ttk.Label(info, textvariable=self.name_var, font=("Microsoft YaHei", 10)).pack(
-            anchor='w', padx=8, pady=(6, 0))
-        ttk.Label(info, textvariable=self.ver_var, font=("Microsoft YaHei", 10)).pack(
-            anchor='w', padx=8, pady=(0, 6))
-
-        bar = ttk.Frame(self)
-        bar.pack(fill=tk.X, pady=10)
-        ttk.Button(bar, text="打开预览窗口", command=self.open_window).pack(side=tk.LEFT)
         self.status_var = tk.StringVar(value="")
-        ttk.Label(bar, textvariable=self.status_var, foreground="#666").pack(side=tk.LEFT, padx=8)
+        ttk.Label(top, textvariable=self.status_var, foreground="#666").pack(side=tk.LEFT, padx=8)
 
-        ttk.Label(self, text=self.TIP, foreground="#888", justify=tk.LEFT).pack(anchor='w')
+        # 预览区:网页窗口会被挂到这个 frame 里,看起来就跟界面是一体的
+        self.stage = tk.Frame(self, bg='#1b1d24')
+        self.stage.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        self.stage.bind('<Configure>', self._on_stage_resize)
 
     # ---------- 打开素材 ----------
     def open_asset(self):
@@ -1239,18 +1243,12 @@ class PreviewPanel(ttk.Frame):
             return
         self.skel_path = skel_path
         self.path_var.set(skel_path)
-        name = os.path.splitext(os.path.basename(skel_path))[0]
-        ver = "未知"
-        try:
-            data = load_skeleton_json(skel_path)
-            skel = data.get('skeleton') or {}
-            name = skel.get('name') or name
-            ver = skel.get('spine') or ver
-        except Exception as e:
-            messagebox.showerror("加载失败", f"解析骨架失败:\n{e}")
-            return
-        self.name_var.set(f"Spine 名称: {name}")
-        self.ver_var.set(f"Spine 版本: {ver}")
+        self.src_ver = peek_spine_version(skel_path)
+        # 3.8 的二进制网页能直接读,老版本得让服务端先转成 3.8 的 json
+        if os.path.splitext(skel_path)[1].lower() == '.skel' and _is_v38(self.src_ver):
+            self.req_name = os.path.basename(skel_path)
+        else:
+            self.req_name = os.path.splitext(os.path.basename(skel_path))[0] + '.json'
         self.on_loaded()
 
     def on_loaded(self):
@@ -1261,11 +1259,31 @@ class PreviewPanel(ttk.Frame):
         if not self.skel_path:
             messagebox.showwarning("提示", "请先打开 Spine 素材")
             return
+        self.update_idletasks()
+        self._close_browser()
         try:
-            open_viewer(self.app.viewer_server, self.skel_path)
-            self.status_var.set("已在预览窗口中打开")
+            self.browser = open_viewer(self.app.viewer_server, self.skel_path,
+                                       parent_hwnd=self.stage.winfo_id(),
+                                       src_version=self.src_ver,
+                                       request_name=self.req_name)
+            self.status_var.set("已在内嵌预览中加载")
         except Exception as e:
             messagebox.showerror("打开失败", str(e))
+
+    def _close_browser(self):
+        if self.browser is not None:
+            try:
+                self.browser.close()
+            except Exception:
+                pass
+            self.browser = None
+
+    def _on_stage_resize(self, _event=None):
+        if self.browser is not None:
+            try:
+                self.browser.resize()
+            except Exception:
+                pass
 
 
 class ConvertPanel(ttk.Frame):
@@ -1369,7 +1387,9 @@ class SpineChangeApp:
         self.root.minsize(860, 620)
 
         # 预览/导出都靠这个本地服务把网页喂给浏览器,全进程共用一个
-        self.viewer_server = ViewerServer(ask_path=self.ask_save_path)
+        # loader 负责把任意版本的骨架转成 3.8 再给网页,这样老版本也能预览
+        self.viewer_server = ViewerServer(ask_path=self.ask_save_path,
+                                          loader=load_skeleton_json)
         self._save_req = None
         self.root.after(120, self._poll_save_req)
 
@@ -1406,6 +1426,7 @@ class SpineChangeApp:
         self.root.after(120, self._poll_save_req)
 
     def on_close(self):
+        self.preview_tab._close_browser()
         self.viewer_server.shutdown()
         self.root.destroy()
 

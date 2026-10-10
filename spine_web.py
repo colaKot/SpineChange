@@ -4,6 +4,8 @@
 这里起一个只监听 127.0.0.1 的小 http 服务,挂上打包进 exe 的网页,再用系统浏览器
 的 app 模式开窗口。导出时网页把逐帧 PNG 传进来,这边用 ffmpeg 合成 mp4。
 """
+import ctypes
+import ctypes.wintypes
 import http.server
 import json
 import os
@@ -12,7 +14,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
+import uuid
 
 import numpy as np
 from PIL import Image
@@ -48,9 +52,11 @@ def _ctype(full):
 class ViewerServer:
     """进程内单例:静态资源 + 导出回调"""
 
-    def __init__(self, ask_path=None):
+    def __init__(self, ask_path=None, loader=None):
         self.ask_path = ask_path      # 由主线程弹保存对话框,签名 ask_path(anim) -> 路径或 ''
+        self.loader = loader          # 把任意版本的骨架读成 3.8 字典,签名 loader(path) -> dict
         self.res_root = None
+        self.skel_path = None
         self.default_name = 'spine'
         self.port = None
         self._httpd = None
@@ -89,6 +95,25 @@ class ViewerServer:
                     return self._file(os.path.join(_web_root(), 'spine_viewer.html'))
                 if path.startswith('/lib/'):
                     return self._file(os.path.join(_web_root(), urllib.parse.unquote(path[1:])))
+                if path.startswith('/api/skeleton/'):
+                    name = urllib.parse.unquote(path[len('/api/skeleton/'):])
+                    # 网页只认 3.8,所以骨架统一转好再给;.atlas/.png 这些贴图资源照原样给
+                    if name.lower().endswith('.json'):
+                        if server.loader is None or not server.skel_path:
+                            return self._send(404, 'no skeleton')
+                        try:
+                            data = server.loader(server.skel_path)
+                        except Exception as e:
+                            return self._send(500, '骨架转换失败: %s' % e,
+                                              'text/plain; charset=utf-8')
+                        return self._send(200, json.dumps(data, ensure_ascii=False),
+                                          'application/json; charset=utf-8')
+                    if server.res_root is None:
+                        return self._send(404, 'no resource')
+                    full = os.path.normpath(os.path.join(server.res_root, name))
+                    if not full.startswith(server.res_root):
+                        return self._send(403, 'denied')
+                    return self._file(full)
                 if path.startswith('/res/'):
                     if server.res_root is None:
                         return self._send(404, 'no resource')
@@ -130,8 +155,12 @@ class ViewerServer:
                 pass
             self._httpd = None
 
-    def set_res_root(self, directory):
-        self.res_root = os.path.abspath(directory)
+    def set_asset(self, path):
+        """预览换一份素材:骨架路径、图集目录、默认文件名都跟着走"""
+        path = os.path.abspath(path)
+        self.skel_path = path
+        self.res_root = os.path.dirname(path)
+        self.default_name = os.path.splitext(os.path.basename(path))[0]
 
     # ---------- 收帧 / 合成 ----------
     def save_frame(self, data):
@@ -177,20 +206,167 @@ class ViewerServer:
             self._frames = 0
 
 
-def open_viewer(server, json_path):
-    """开预览窗口;素材目录换成这份骨架所在目录"""
-    server.ensure_started()
-    server.set_res_root(os.path.dirname(os.path.abspath(json_path)))
-    server.default_name = os.path.splitext(os.path.basename(json_path))[0]
-    url = 'http://127.0.0.1:%d/?json=%s' % (
-        server.port, urllib.parse.quote(os.path.basename(json_path)))
+# ======================== 内嵌浏览器 ========================
+
+_GWL_STYLE = -16
+_WS_CHILD = 0x40000000
+_WS_POPUP = 0x80000000
+_WS_CAPTION = 0x00C00000
+_WS_THICKFRAME = 0x00040000
+
+_user32_cache = None
+
+
+def _user32():
+    """配好参数类型的 user32,不然后面传 HWND 在 64 位上会被截断"""
+    global _user32_cache
+    if _user32_cache is not None:
+        return _user32_cache
+    u = ctypes.windll.user32
+    u.SetParent.restype = ctypes.c_void_p
+    u.SetParent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    u.GetWindowLongW.restype = ctypes.c_long
+    u.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    u.SetWindowLongW.restype = ctypes.c_long
+    u.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+    u.MoveWindow.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int, ctypes.c_bool]
+    u.GetClientRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.wintypes.RECT)]
+    u.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.wintypes.RECT)]
+    u.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    _user32_cache = u
+    return u
+
+
+class EmbeddedBrowser:
+    """把浏览器窗口挂进 tk 的 frame 里,看起来就跟界面是一体的
+
+    tk 自己画不了 WebGL,只能借系统浏览器;这里开个 --app 窗口,再把它的 HWND
+    用 SetParent 挂到 frame 上。挂不上就留在外面当普通窗口,不影响用。
+    """
+
+    def __init__(self, url, parent_hwnd, size=(1180, 760)):
+        self.url = url
+        self.parent = int(parent_hwnd)
+        self.size = size
+        self.title = 'SpineChange预览-' + uuid.uuid4().hex[:8]
+        self.proc = None
+        self.hwnd = None
+
+    def start(self):
+        exe = next((p for p in _BROWSERS if os.path.isfile(p)), None)
+        if not exe:
+            return False
+        left, top, w, h = self._parent_rect()
+        cmd = [exe,
+               '--app=%s&title=%s' % (self.url, urllib.parse.quote(self.title)),
+               '--user-data-dir=' + tempfile.mkdtemp(prefix='spine_web_'),
+               '--no-first-run', '--no-default-browser-check',
+               '--window-position=%d,%d' % (left, top),
+               '--window-size=%d,%d' % (w, h)]
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+        except Exception:
+            return False
+        # 等窗口起来再挂,别卡住 tk 主线程
+        threading.Thread(target=self._attach, daemon=True).start()
+        return True
+
+    def _parent_rect(self):
+        u = _user32()
+        rect = ctypes.wintypes.RECT()
+        if u.GetWindowRect(ctypes.c_void_p(self.parent), ctypes.byref(rect)):
+            w = max(320, rect.right - rect.left)
+            h = max(240, rect.bottom - rect.top)
+            return rect.left, rect.top, w, h
+        return 80, 80, self.size[0], self.size[1]
+
+    def _attach(self):
+        u = _user32()
+        end = time.time() + 12
+        while time.time() < end:
+            hwnd = self._find_window(u)
+            if hwnd:
+                try:
+                    # 必须先改成 WS_CHILD 再 SetParent:顺序反了 SetParent 不生效
+                    style = u.GetWindowLongW(hwnd, _GWL_STYLE)
+                    style &= ~(_WS_POPUP | _WS_CAPTION | _WS_THICKFRAME)
+                    style |= _WS_CHILD
+                    style &= 0xFFFFFFFF
+                    if style >= 0x80000000:
+                        style -= 0x100000000
+                    u.SetWindowLongW(hwnd, _GWL_STYLE, style)
+                    u.SetParent(hwnd, ctypes.c_void_p(self.parent))
+                    self.hwnd = hwnd
+                    self.resize()
+                except Exception:
+                    self.hwnd = None
+                return
+            time.sleep(0.25)
+
+    def _find_window(self, u):
+        found = []
+
+        def cb(hwnd, _param):
+            buf = ctypes.create_unicode_buffer(256)
+            u.GetWindowTextW(hwnd, buf, 256)
+            if buf.value == self.title:
+                found.append(hwnd)
+            return True
+
+        u.EnumWindows(ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
+                                         ctypes.c_void_p)(cb), None)
+        return found[0] if found else None
+
+    def resize(self):
+        if not self.hwnd:
+            return
+        u = _user32()
+        rect = ctypes.wintypes.RECT()
+        if not u.GetClientRect(ctypes.c_void_p(self.parent), ctypes.byref(rect)):
+            return
+        w, h = rect.right - rect.left, rect.bottom - rect.top
+        if w > 0 and h > 0:
+            u.MoveWindow(self.hwnd, 0, 0, w, h, True)
+
+    def close(self):
+        self.hwnd = None
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+            self.proc = None
+
+
+def _open_browser_window(url):
     exe = next((p for p in _BROWSERS if os.path.isfile(p)), None)
     if exe:
         try:
             subprocess.Popen([exe, '--app=' + url, '--window-size=1180,860'])
-            return url
+            return
         except Exception:
             pass
     import webbrowser
     webbrowser.open(url)
-    return url
+
+
+def open_viewer(server, json_path, parent_hwnd=None, src_version='', request_name=None):
+    """打开预览:能挂进 tk 窗口就挂进去,挂不了再退回独立窗口
+
+    request_name 是网页要取的骨架名:老版本给 .json(服务端转 3.8),
+    本身 3.8 的二进制给 .skel(直接读)。不传就按 .json 处理。
+    返回内嵌的浏览器对象(供上层做缩放/关闭),退回独立窗口时返回 None。
+    """
+    server.ensure_started()
+    server.set_asset(json_path)
+    name = request_name or (server.default_name + '.json')
+    url = 'http://127.0.0.1:%d/?json=%s&ver=%s' % (
+        server.port, urllib.parse.quote(name), urllib.parse.quote(src_version or ''))
+    if parent_hwnd:
+        browser = EmbeddedBrowser(url, parent_hwnd)
+        browser.start()
+        return browser
+    _open_browser_window(url)
+    return None
