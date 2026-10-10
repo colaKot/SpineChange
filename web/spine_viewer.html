@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Spine 预览</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1d24; color: #ddd;
+               font: 13px/1.5 "Microsoft YaHei", sans-serif; }
+  #main { display: flex; height: 100%; }
+  #stage { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #cv { flex: 1; min-height: 0; position: relative; }
+  #cv canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+  #cv canvas.drag { cursor: grabbing; }
+  #foot { padding: 6px 10px; border-top: 1px solid #303440; background: #22252e; }
+  #foot div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #side { width: 260px; flex: none; border-left: 1px solid #303440; background: #22252e;
+          display: flex; flex-direction: column; }
+  .box { padding: 8px; border-bottom: 1px solid #303440; }
+  .box h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: #9fd3ff; }
+  .row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+  .row label { color: #9aa3b2; width: 48px; flex: none; }
+  input[type=text] { width: 100%; min-width: 0; background: #171a21; color: #ddd;
+                     border: 1px solid #3a3f4d; border-radius: 3px; padding: 3px 6px; }
+  input[type=range] { flex: 1; min-width: 0; }
+  #speedv { width: 36px; flex: none; text-align: right; color: #9aa3b2; }
+  button { background: #2f3644; color: #ddd; border: 1px solid #444c5e; border-radius: 3px;
+           padding: 4px 10px; cursor: pointer; }
+  button:hover { background: #3a4354; }
+  button:disabled { opacity: .5; cursor: default; }
+  #actions { flex: 1; overflow: auto; padding: 6px; }
+  #actions button { display: block; width: 100%; text-align: left; margin-bottom: 4px; }
+  #actions button.on { background: #2b6cb0; border-color: #3f8fd8; }
+  #status { padding: 6px 8px; font-size: 12px; color: #9aa3b2; min-height: 20px; }
+  #err { position: fixed; left: 8px; top: 8px; right: 8px; white-space: pre-wrap; color: #ff8080;
+         background: #000c; padding: 6px; z-index: 99; display: none; font-family: Consolas, monospace; }
+</style>
+</head>
+<body>
+<div id="err"></div>
+<div id="main">
+  <div id="stage">
+    <div id="cv"></div>
+    <div id="foot">
+      <div id="nm">Spine 名称: -</div>
+      <div id="vr">Spine 版本: -</div>
+    </div>
+  </div>
+  <div id="side">
+    <div class="box">
+      <h3>视图</h3>
+      <div class="row"><label>缩放%</label><input type="text" id="zoom" value="100"></div>
+      <div class="row"><label>水平</label><input type="text" id="dx" value="0"></div>
+      <div class="row"><label>垂直</label><input type="text" id="dy" value="0"></div>
+      <div class="row"><label>速度</label><input type="range" id="speed" min="0.5" max="2" step="0.1" value="1"><span id="speedv">1.0x</span></div>
+      <div class="row">
+        <button id="apply">应用</button>
+        <button id="reset">复位</button>
+      </div>
+      <div style="color:#7a8291;font-size:12px">画布可拖动平移，滚轮缩放</div>
+    </div>
+    <div class="box" id="exportbox">
+      <h3>导出 MP4</h3>
+      <div class="row"><button id="expbtn">转视频</button></div>
+      <div id="status">调整好位置后点「转视频」</div>
+    </div>
+    <div class="box" style="flex:1;display:flex;flex-direction:column;min-height:0;border-bottom:none">
+      <h3>动作</h3>
+    </div>
+    <div id="actions"></div>
+  </div>
+</div>
+
+<script src="lib/pixi-6.2.2.js"></script>
+<script src="lib/pixi-spine-3.8.js"></script>
+<script>
+const Q = new URLSearchParams(location.search);
+const JSON_NAME = Q.get('json') || '';
+
+function fail(msg) {
+  const el = document.getElementById('err');
+  el.style.display = 'block';
+  el.textContent += msg + '\n';
+}
+window.onerror = (m, s, l, c) => fail('错误: ' + m + ' @' + l + ':' + c);
+
+const cvBox = document.getElementById('cv');
+let app, spine, animNames = [], curAnim = null;
+let baseScale = 1, centerX = 0, centerY = 0, zoom = 1, dx = 0, dy = 0;
+let setupBounds = null, playing = true, exporting = false, speed = 1;
+
+function viewSize() {
+  // 宽高取偶数,不然导出时 libx264 会因为 yuv420p 对不齐直接报错
+  const w = Math.max(cvBox.clientWidth || 0, 320);
+  const h = Math.max(cvBox.clientHeight || 0, 320);
+  return [w - (w % 2), h - (h % 2)];
+}
+
+app = new PIXI.Application({
+  backgroundColor: 0x1b1d24, antialias: true, preserveDrawingBuffer: true,
+  width: viewSize()[0], height: viewSize()[1]
+});
+cvBox.appendChild(app.view);
+
+const bg = new PIXI.Graphics();
+app.stage.addChild(bg);
+function paintBg() {
+  bg.clear();
+  bg.beginFill(0x1b1d24).drawRect(0, 0, app.screen.width, app.screen.height).endFill();
+}
+paintBg();
+
+PIXI.Loader.shared.add('sp', '/res/' + encodeURIComponent(JSON_NAME)).load((ld, res) => {
+  const data = res.sp.spineData;
+  spine = new PIXI.spine.Spine(data);
+  // pixi-spine 的 autoUpdate 会在渲染时再按墙上时间推一次动作,和我们 ticker 叠加就是双倍速,关掉
+  spine.autoUpdate = false;
+  app.stage.addChild(spine);
+
+  document.getElementById('nm').textContent = 'Spine 名称: ' + (data.name || JSON_NAME.replace(/\.[^.]+$/, ''));
+  document.getElementById('vr').textContent = 'Spine 版本: ' + (data.version || '未知');
+
+  spine.skeleton.setToSetupPose();
+  spine.skeleton.updateWorldTransform();
+  setupBounds = spine.getLocalBounds().clone();
+
+  animNames = data.animations.map(a => a.name);
+  buildActions();
+  if (animNames.length) play(animNames[0]);
+
+  document.getElementById('expbtn').onclick = exportVideo;
+
+  resize();
+  window.addEventListener('resize', resize);
+  new ResizeObserver(resize).observe(cvBox);
+  app.ticker.add(() => { if (playing && !exporting && spine) spine.update(app.ticker.deltaMS / 1000 * speed); });
+}, err => fail('加载失败: ' + err));
+
+function buildActions() {
+  const box = document.getElementById('actions');
+  box.innerHTML = '';
+  animNames.forEach(n => {
+    const b = document.createElement('button');
+    b.textContent = n;
+    b.dataset.name = n;
+    b.onclick = () => play(n);
+    box.appendChild(b);
+  });
+}
+
+function union(a, b) {
+  const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+  const r = Math.max(a.x + a.width, b.x + b.width);
+  const bt = Math.max(a.y + a.height, b.y + b.height);
+  return new PIXI.Rectangle(x, y, r - x, bt - y);
+}
+
+// 逐帧采样一遍,把动作里跑得最远的姿势也算进取景,免得动作出画
+function animBounds(name) {
+  const anim = spine.spineData.findAnimation(name);
+  const dur = anim ? anim.duration : 0;
+  seek(name, 0);
+  let b = spine.getLocalBounds().clone();
+  const step = 1 / 30;
+  for (let t = step; t <= dur + step * 0.5; t += step) {
+    seek(name, t);
+    b = union(b, spine.getLocalBounds());
+  }
+  return b;
+}
+
+// 把动作定位到指定时间:先回初始姿势清掉上个动作的残留,再重设轨道推进 t 秒
+function seek(name, t) {
+  spine.skeleton.setToSetupPose();
+  spine.state.clearTracks();
+  spine.state.setAnimation(0, name, true);
+  spine.update(t);
+}
+
+function play(name) {
+  curAnim = name;
+  // 采包围盒时要独占骨架,先停掉 ticker 的自动更新
+  playing = false;
+  [...document.querySelectorAll('#actions button')].forEach(b =>
+    b.classList.toggle('on', b.dataset.name === name));
+  const bb = union(setupBounds, animBounds(name));
+  if (bb.width > 0 && bb.height > 0) {
+    baseScale = Math.min(app.screen.width * 0.9 / bb.width, app.screen.height * 0.9 / bb.height);
+    centerX = bb.x + bb.width / 2;
+    centerY = bb.y + bb.height / 2;
+  }
+  seek(name, 0);
+  applyView();
+  playing = true;
+}
+
+function applyView() {
+  if (!spine) return;
+  const s = baseScale * zoom;
+  spine.scale.set(s);
+  spine.x = app.screen.width / 2 - centerX * s + dx;
+  spine.y = app.screen.height / 2 - centerY * s + dy;
+  document.getElementById('zoom').value = Math.round(zoom * 100);
+  document.getElementById('dx').value = Math.round(dx);
+  document.getElementById('dy').value = Math.round(dy);
+}
+
+function resize() {
+  const [w, h] = viewSize();
+  if (app.screen.width === w && app.screen.height === h) return;
+  app.renderer.resize(w, h);
+  paintBg();
+  if (spine) {
+    spine.x = w / 2 - centerX * baseScale * zoom + dx;
+    spine.y = h / 2 - centerY * baseScale * zoom + dy;
+  }
+}
+
+document.getElementById('apply').onclick = () => {
+  zoom = Math.max(0.02, Math.min(20, (parseFloat(document.getElementById('zoom').value) || 100) / 100));
+  dx = parseFloat(document.getElementById('dx').value) || 0;
+  dy = parseFloat(document.getElementById('dy').value) || 0;
+  applyView();
+};
+document.getElementById('reset').onclick = () => { zoom = 1; dx = 0; dy = 0; applyView(); };
+
+const speedEl = document.getElementById('speed');
+speedEl.oninput = () => {
+  speed = parseFloat(speedEl.value) || 1;
+  document.getElementById('speedv').textContent = speed.toFixed(1) + 'x';
+};
+
+let dragFrom = null;
+app.view.addEventListener('mousedown', e => {
+  dragFrom = [e.clientX, e.clientY];
+  app.view.classList.add('drag');
+});
+window.addEventListener('mousemove', e => {
+  if (!dragFrom) return;
+  dx += e.clientX - dragFrom[0];
+  dy += e.clientY - dragFrom[1];
+  dragFrom = [e.clientX, e.clientY];
+  applyView();
+});
+window.addEventListener('mouseup', () => { dragFrom = null; app.view.classList.remove('drag'); });
+app.view.addEventListener('wheel', e => {
+  e.preventDefault();
+  zoom = Math.max(0.02, Math.min(20, zoom * (e.deltaY < 0 ? 1.1 : 1 / 1.1)));
+  applyView();
+}, { passive: false });
+
+// ---------- 导出 ----------
+function setStatus(t) { document.getElementById('status').textContent = t; }
+
+async function exportVideo() {
+  if (exporting || !spine || !curAnim) return;
+  const btn = document.getElementById('expbtn');
+  const anim = spine.spineData.findAnimation(curAnim);
+  const fps = Math.max(1, spine.spineData.fps || 30);
+  let path;
+  try {
+    const r = await fetch('/api/pick_save?name=' + encodeURIComponent(curAnim), { method: 'POST' });
+    path = (await r.json()).path;
+  } catch (e) { fail('选保存路径失败: ' + e.message); return; }
+  if (!path) return;
+
+  exporting = true;
+  btn.disabled = true;
+  const total = Math.max(1, Math.round((anim ? anim.duration : 0) * fps));
+  try {
+    for (let i = 0; i < total; i++) {
+      seek(curAnim, i / fps);
+      app.renderer.render(app.stage);
+      const blob = await new Promise(res => app.view.toBlob(res, 'image/png'));
+      const r = await fetch('/api/frame?i=' + i, { method: 'POST', body: blob });
+      if (!r.ok) throw new Error('第 ' + i + ' 帧上传失败 ' + r.status);
+      if (i % 3 === 0 || i === total - 1) setStatus('导出中... ' + Math.round((i + 1) * 100 / total) + '%');
+    }
+    setStatus('正在合成视频...');
+    const r = await fetch('/api/video_end', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: path, fps: fps, frames: total })
+    });
+    const j = await r.json();
+    if (j.error) throw new Error(j.error);
+    setStatus('已导出: ' + path);
+  } catch (e) {
+    setStatus('导出失败');
+    fail('导出失败: ' + e.message);
+  } finally {
+    exporting = false;
+    btn.disabled = false;
+    seek(curAnim, 0);
+    playing = true;
+  }
+}
+</script>
+</body>
+</html>

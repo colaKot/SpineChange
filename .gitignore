@@ -1,0 +1,22 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- PyInstaller 打包产物 ---
+build/
+dist/
+*.manifest
+*.exe
+
+# --- 仅作本地参考的第三方网页项目（体积大，非本仓库源码） ---
+chibi-gif-cljs2/
+
+# --- 编辑器 / 系统 ---
+.vscode/
+.idea/
+.trae/
+Thumbs.db
+desktop.ini
